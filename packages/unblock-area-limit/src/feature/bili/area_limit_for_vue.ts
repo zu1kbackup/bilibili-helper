@@ -1,6 +1,6 @@
 import { BiliBiliApi } from "../../api/bilibili"
-import { SeasonInfoOnBangumi } from "../../api/bilibili"
 import { BiliPlusApi } from "../../api/biliplus"
+import { BalhDb } from "../../util/balh-db"
 import { Converters } from "../../util/converters"
 import { cookieStorage } from "../../util/cookie"
 import { util_init } from "../../util/initiator"
@@ -12,7 +12,8 @@ import { ui } from "../../util/ui"
 import { ifNotNull } from "../../util/utils"
 import { balh_config, isClosed } from "../config"
 import { util_page } from "../page"
-import pageTemplate from './bangumi-play-page-template.html' // 不用管这个报错
+import pageTemplate from './bangumi-play-page-template.html'
+import { bilibili_login } from "./bilibili_login"
 
 export function modifyGlobalValue<T = any>(
     name: string,
@@ -111,44 +112,45 @@ interface TemplateArgs {
     appOnly: boolean,
 }
 
-
 async function fixThailandSeason(ep_id: string, season_id: string) {
     // 部分泰区番剧通过 bangumi 无法取得数据或者数据不完整
     // 通过泰区 api 补全
     // https://github.com/yujincheng08/BiliRoaming/issues/112
     const thailandApi = new BiliBiliApi(balh_config.server_custom_th)
     const origin = await thailandApi.getSeasonInfoByEpSsIdOnThailand(ep_id, season_id)
-    const input_episodes = origin.result.modules[0].data.episodes
-
+    if (origin.code === 401)
+        bilibili_login.clearLoginFlag()
     origin.result.actors = origin.result.actor.info
     origin.result.is_paster_ads = 0
     origin.result.jp_title = origin.result.origin_name
     origin.result.newest_ep = origin.result.new_ep
     origin.result.season_status = origin.result.status
     origin.result.season_title = origin.result.title
-    origin.result.total_ep = input_episodes.length
     origin.result.rights.watch_platform = 1
 
     origin.result.episodes = []
-    input_episodes.forEach((ep) => {
-        ep.episode_status = ep.status
-        ep.ep_id = ep.id
-        ep.index = ep.title
-        ep.index_title = ep.long_title
-        origin.result.episodes?.push(ep)
-    })
-
+    if (origin.result.modules.length > 0) {
+        origin.result.modules[0].data.episodes.forEach((ep) => {
+            ep.episode_status = ep.status
+            ep.ep_id = ep.id
+            ep.index = ep.title
+            ep.index_title = ep.long_title
+            origin.result.episodes?.push(ep)
+            if (season_id !== '5551')
+                BalhDb.setSsId(ep.id, season_id)//
+                    .catch((e) => util_warn('setSsId failed', e))
+        })
+        origin.result.total = origin.result.modules[0].data.episodes.length
+    }
+    origin.result.total_ep = origin.result.total
     origin.result.style = []
     origin.result.styles?.forEach((it) => {
         origin.result.style.push(it.name)
     })
-
-    let result: SeasonInfoOnBangumi = JSON.parse(JSON.stringify(origin))
-    return result
+    return { code: origin.code, message: origin.message, data: origin.result }
 }
 
 let invalidInitialState: StringAnyObject | undefined
-
 function fixBangumiPlayPage() {
     util_init(async () => {
         if (util_page.bangumi_md()) {
@@ -156,15 +158,16 @@ function fixBangumiPlayPage() {
             cookieStorage.set('balh_curr_season_id', window?.__INITIAL_STATE__?.mediaInfo?.season_id, '')
         }
         if (util_page.anime_ep() || util_page.anime_ss()) {
-            const $app = document.getElementById('app')
-            if (!$app || invalidInitialState) {
+            // 旧版偶尔会出现client-app，why？
+            const $app = document.getElementById('app') || document.getElementById('client-app');
+            if ((!$app || invalidInitialState) && !window.__NEXT_DATA__) {
                 // 这个fixBangumiPlayPage()函数，本来是用来重建appOnly页面的，不过最近这样appOnly的页面基本上没有了，反而出现了一批非appOnly但页面也需要重建的情况
                 // 如：https://www.bilibili.com/bangumi/media/md28235576
                 // 故当前默认值改为false🤔
                 let appOnly = invalidInitialState?.mediaInfo?.rights?.appOnly ?? false
                 try {
                     // 读取保存的season_id
-                    const season_id = (window.location.pathname.match(/\/bangumi\/play\/ss(\d+)/) || ['', cookieStorage.get('balh_curr_season_id')])[1]
+                    let season_id = (window.location.pathname.match(/\/bangumi\/play\/ss(\d+)/) || ['', cookieStorage.get('balh_curr_season_id')])[1]
                     const ep_id = (window.location.pathname.match(/\/bangumi\/play\/ep(\d+)/) || ['', ''])[1]
                     const bilibiliApi = new BiliBiliApi(balh_config.server_bilibili_api_proxy)
                     let templateArgs: TemplateArgs | null = null
@@ -172,48 +175,118 @@ function fixBangumiPlayPage() {
                     // 不限制地区的接口，可以查询泰区番剧，该方法前置给代理服务器和BP节省点请求
                     // 如果该接口失效，自动尝试后面的方法
                     try {
-                        let result = await bilibiliApi.getSeasonInfoByEpSsIdOnBangumi(ep_id, season_id)
-                        if (balh_config.server_custom_th && (result.code == -404 || result.result.up_info.mid == 677043260 /* 主站残留泰区数据，部分不完整 */)) {
+                        let result = await bilibiliApi.getSeasonInfoById(season_id, ep_id)
+                        if (result.code == -404) {
+                            if (season_id) {
+                                try {
+                                    let mediaInfo = await bilibiliApi.getMediaInfoBySeasonId(season_id)
+                                    if (mediaInfo.season_id) {
+                                        mediaInfo.refine_cover = decodeURI(mediaInfo.cover)
+                                        mediaInfo.share_copy = mediaInfo.title
+                                        mediaInfo.share_url = `https://www.bilibili.com/bangumi/play/ss${mediaInfo.season_id}`
+                                        mediaInfo.short_link = `https://b23.tv/ss${mediaInfo.season_id}`
+                                        mediaInfo.status = mediaInfo.season_status
+                                        mediaInfo.rights.area_limit = 0
+                                        mediaInfo.rights.ban_area_show = 0
+                                        mediaInfo.rights.is_preview = 0
+                                        mediaInfo.staff = { info: mediaInfo.staff }
+                                        result = { code: 0, data: mediaInfo, message: "success" }
+                                    }
+                                } catch (error) {
+                                }
+                            }
+                        }
+                        if (result.code != 0 && balh_config.server_custom_th) {
                             result = await fixThailandSeason(ep_id, season_id)
                             appOnly = true
                         }
-                        if (result.code) {
+                        if (result.code != 0) {
                             throw result
                         }
-                        const ep = ep_id != '' ? result.result.episodes.find(ep => ep.ep_id === +ep_id) : result.result.episodes[0]
-                        if (!ep) {
-                            throw `通过bangumi接口未找到${ep_id}对应的视频信息`
+                        if (ep_id != '') season_id = result.data.season_id.toString()
+                        result.result = result.data
+                        result.result.modules?.forEach((module: { data: { [x: string]: any }; id: any }, mid: number) => {
+                            if (module.data) {
+                                let sid = module.id ? module.id : mid + 1
+                                module.data['id'] = sid
+                            }
+                        })
+                        let seasons: any[] = []
+                        result.result.modules?.forEach((module: { data: { seasons?: any[], episodes?: any[] } }) => {
+                            if (module.data.seasons) {
+                                module.data.seasons.forEach(season => {
+                                    seasons.push(season)
+                                })
+                            } else if (module.data.episodes) {
+                                module.data.episodes.forEach(ep => {
+                                    seasons.push(ep)
+                                })
+                            }
+                        })
+                        result.result['seasons'] = seasons
+                        if (!result.result.episodes) {
+                            const section = await bilibiliApi.getSeasonSectionBySsId(season_id)
+                            result.result['episodes'] = section.result.main_section.episodes
+                            result.result['section'] = section.result.section
+                            result.result['positive'] = { id: section.result.main_section.id, title: section.result.main_section.title }
                         }
+
+                        if (result.result.episodes.length > 0) {
+                            const episodeInfo = await bilibiliApi.getEpisodeInfoByEpId(result.result.episodes[0].id)
+                            if (episodeInfo.code = 0) {
+                                result.result['up_info'] = episodeInfo.data.related_up[0]
+                            }
+                            result.result.episodes.forEach((ep: { [x: string]: any; id: any }) => {
+                                ep['bvid'] = Converters.aid2bv(ep.aid)
+                                ep['ep_id'] = ep.id
+                                ep['link'] = `https://www.bilibili.com/bangumi/play/ep${ep.id}`
+                                ep['rights'] = { allow_download: 1, area_limit: 0, allow_dm: 1 }
+                                ep['short_link'] = `https://b23.tv/ep${ep.id}`
+                            })
+                        }
+                        if (result.result.section) {
+                            result.result.section.forEach(section => {
+                                section.episodes.forEach((ep: { [x: string]: any; id: any }) => {
+                                    ep['bvid'] = Converters.aid2bv(ep.aid)
+                                    ep['ep_id'] = ep.id
+                                    ep['link'] = `https://www.bilibili.com/bangumi/play/ep${ep.id}`
+                                    ep['rights'] = { allow_download: 1, area_limit: 0, allow_dm: 1 }
+                                    ep['short_link'] = `https://b23.tv/ep${ep.id}`
+                                })
+                            })
+                        }
+                        const ep = ep_id != '' ? result.result.episodes.find(ep => ep.ep_id === +ep_id) : result.result.episodes[0]
                         const eps = JSON.stringify(result.result.episodes.map((item, index) => {
                             // 返回的数据是有序的，不需要另外排序                                
-                            if (/^\d+(\.\d+)?$/.exec(item.index)) {
-                                item.titleFormat = "第" + item.index + "话 " + item.index_title
+                            if (/^\d+(\.\d+)?$/.exec(item.title)) {
+                                item.titleFormat = "第" + item.title + "话 " + item.long_title
                             } else {
-                                item.titleFormat = item.index
-                                item.index_title = item.index
+                                item.titleFormat = item.long_title
                             }
+                            item.index_title = item.long_title
                             item.loaded = true
-                            item.epStatus = item.episode_status
+                            item.epStatus = item.status
                             item.sectionType = 0
                             item.id = +item.ep_id
                             item.i = index
                             item.link = 'https://www.bilibili.com/bangumi/play/ep' + item.ep_id
-                            item.title = item.index
+                            item.title = item.titleFormat
+                            if (item.jump) item['skip'] = item.jump
                             return item
                         }))
                         let titleForma
-                        if (ep.index_title) {
+                        if (ep?.index_title) {
                             titleForma = ep.index_title
                         } else {
-                            titleForma = "第" + ep.index + "话"
+                            titleForma = "第" + ep?.index + "话"
                         }
                         templateArgs = {
-                            id: ep.ep_id,
-                            aid: ep.aid,
-                            cid: ep.cid,
-                            bvid: ep.bvid,
-                            title: ep.index,
-                            titleFormat: titleForma,
+                            id: ep?.ep_id,
+                            aid: ep?.aid,
+                            cid: ep?.cid,
+                            bvid: ep?.bvid,
+                            title: ep?.index,
+                            titleFormat: Strings.escapeSpecialChars(titleForma),
                             htmlTitle: result.result.title,
                             mediaInfoId: result.result.media_id,
                             mediaInfoTitle: result.result.title,
@@ -229,7 +302,7 @@ function fixBangumiPlayPage() {
 
                     if (balh_config.server_bilibili_api_proxy && !templateArgs) {
                         try {
-                            const result = await bilibiliApi.getSeasonInfoByEpId(ep_id)
+                            const result = await bilibiliApi.getSeasonInfoByEpSsId(ep_id, season_id)
                             if (result.code) {
                                 throw result
                             }
@@ -330,9 +403,9 @@ function fixBangumiPlayPage() {
                     await cloneChildNodes(template.getElementsByTagName('head')[0], document.head)
                     await cloneChildNodes(template.getElementsByTagName('body')[0], document.body)
                     window.bangumi_area_limit_hack._setupSettings()
-                } catch (e) {
+                } catch (e: any) {
                     util_warn('重建ep页面失败', e)
-                    ui.alert(Objects.stringify(e))
+                    ui.alert(Objects.stringify(e as any))
                 }
             }
         }
@@ -351,6 +424,22 @@ function fixBangumiPlayPage() {
             }
         }
     })
+}
+
+export function removeEpAreaLimit(ep: StringAnyObject) {
+    if (ep.epRights) {
+        ep.epRights.area_limit = false
+        ep.epRights.allow_dm = 1
+    }
+    if (ep.rights) {
+        ep.rights.area_limit = 0
+        ep.rights.allow_dm = 1
+    }
+    if (ep.badge === '受限' || ep.badge_info.text === '受限') {
+        ep.badge = ''
+        ep.badge_info = { "bg_color": "#FB7299", "bg_color_night": "#BB5B76", "text": "" }
+        ep.badge_type = 0
+    }
 }
 
 export function area_limit_for_vue() {
@@ -387,24 +476,79 @@ export function area_limit_for_vue() {
         })
     }
 
+    function processUserStatus(value: StringAnyObject | undefined) {
+        if (value) {
+            // 区域限制
+            // todo      : 调用areaLimit(limit), 保存区域限制状态
+            // 2019-08-17: 之前的接口还有用, 这里先不保存~~
+            value.area_limit = 0
+            // 会员状态
+            if (balh_config.blocked_vip && value.vip_info) {
+                value.vip_info.status = 1
+                value.vip_info.type = 2
+            }
+        }
+    }
+
     function replaceUserState() {
         modifyGlobalValue('__PGC_USERSTATE__', {
             onWrite: (value) => {
-                if (value) {
-                    // 区域限制
-                    // todo      : 调用areaLimit(limit), 保存区域限制状态
-                    // 2019-08-17: 之前的接口还有用, 这里先不保存~~
-                    value.area_limit = 0
-                    // 会员状态
-                    if (balh_config.blocked_vip && value.vip_info) {
-                        value.vip_info.status = 1
-                        value.vip_info.type = 2
-                    }
-                }
+                processUserStatus(value)
                 return value
             }
         })
     }
+
+    /** 拦截处理新页面的初始数据 */
+    function replaceNextData() {
+        modifyGlobalValue('__NEXT_DATA__', {
+            onWrite: (value) => {
+                // 结构变了很多，新版是SSR可能一开始会取不到或者是个dom，无论如何先try一下
+                try {
+                    // 一开始是个dom，放里面一起try了
+                    if (value instanceof Element) {
+                        value = JSON.parse(value.innerHTML)
+                    }
+                    const queries = value.props.pageProps.dehydratedState.queries
+                    if (!queries) return value
+                    for (const query of queries) {
+                        const data = query.state.data
+                        switch (query.queryKey[0]) {
+                            case 'pgc/view/web/season':
+                                if (data.epMap) {
+                                    // 最重要的一项数据, 直接决定页面是否可播放
+                                    Object.keys(data.epMap).forEach(epId => removeEpAreaLimit(data.epMap[epId]))
+                                    data.mediaInfo.episodes.forEach(removeEpAreaLimit)
+                                    // 其他字段对结果似乎没有影响, 故注释掉(
+                                    // data.mediaInfo.hasPlayableEp = true
+                                    // data.initEpList.forEach(removeEpAreaLimit)
+                                    // data.rights.area_limit = false
+                                    // data.rights.allow_dm = 1
+                                } else if (data.seasonInfo.mediaInfo.episodes.length > 0) {
+                                    data.seasonInfo.mediaInfo.episodes.forEach(removeEpAreaLimit)
+                                } else if (data.seasonInfo && !data.seasonInfo.mediaInfo.rights.can_watch) {
+                                    // 新版没有Playable的是预告 PV，不能直接跳过，can_watch=false 才替换
+                                    return;
+                                }
+                                break;
+                            case 'season/user/status':
+                                processUserStatus(data)
+                                break;
+                        }
+                    }
+                    return value
+                } catch {
+                    return
+                }
+            },
+            onRead: (value) => {
+                // debugger
+                return value
+            }
+        })
+    }
+
+    /** 拦截处理老页面的数据 */
     function replaceInitialState() {
         modifyGlobalValue('__INITIAL_STATE__', {
             onWrite: (value) => {
@@ -431,6 +575,8 @@ export function area_limit_for_vue() {
             }
         })
     }
+    replaceNextData()
+
     replaceInitialState()
     replaceUserState()
     replacePlayInfo()

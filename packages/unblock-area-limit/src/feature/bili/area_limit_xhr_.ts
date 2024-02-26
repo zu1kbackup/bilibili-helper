@@ -1,396 +1,308 @@
-import { Objects } from './util/objects'
-import { Converters, uposMap } from './util/converters';
-import { _ } from './util/react'
-import { Async, Promise } from './util/async';
-import { r, _t } from './feature/r'
-import { util_error, util_info, util_log, util_warn, util_debug, logHub } from './util/log'
-import { cookieStorage } from './util/cookie'
-import { balh_config, isClosed } from './feature/config'
-import { Func } from './util/utils';
-import { util_page } from './feature/page'
-import { access_key_param_if_exist, platform_android_param_if_app_only } from './api/bilibili'
-import { BiliPlusApi, generateMobiPlayUrlParams, getMobiPlayUrl, fixMobiPlayUrlJson, fixThailandPlayUrlJson } from './api/biliplus'
-import { ui } from './util/ui'
-import { Strings } from './util/strings'
-import { util_init } from './util/initiator'
-import { util_ui_msg } from './util/message'
-import { RegExps } from './util/regexps'
-import * as bili from './feature/bili';
-import { injectFetch, injectFetch4Mobile } from './feature/bili/area_limit'
-import space_account_info_map from './feature/bili/space_account_info_map'
+// @ts-nocheck
+import { Objects } from '../../util/objects'
+import { Converters, uposMap } from '../../util/converters';
+import { _ } from '../../util/react'
+import { Async, Promise } from '../../util/async';
+import { r, _t } from '../../feature/r'
+import { util_error, util_warn, log } from '../../util/log'
+import { cookieStorage } from '../../util/cookie'
+import { balh_config, isClosed } from '../../feature/config'
+import { util_page } from '../../feature/page'
+import { access_key_param_if_exist, platform_android_param_if_app_only } from '../../api/bilibili-utils'
+import { generateMobiPlayUrlParams, getMobiPlayUrl, fixMobiPlayUrlJson, fixThailandPlayUrlJson } from '../../api/biliplus'
+import { ui } from '../../util/ui'
+import { Strings } from '../../util/strings'
+import { util_init } from '../../util/initiator'
+import { util_ui_msg } from '../../util/message'
+import { RegExps } from '../../util/regexps'
+import { bilibili_login } from './bilibili_login';
+import { injectFetch, injectFetch4Mobile } from '../../feature/bili/area_limit_fetch'
+import space_account_info_map from '../../feature/bili/space_account_info_map'
+import * as OpenCC from 'opencc-js'
+import { removeEpAreaLimit } from '../../feature/bili/area_limit_for_vue'
+import { injectXhr as injectXhrImpl } from '../../util/inject-xhr';
 
-function scriptContent() {
-    'use strict';
-    let log = console.log.bind(console, 'injector:')
-    if (document.getElementById('balh-injector-source') && invokeBy === GM_info.scriptHandler) {
-        // 当前, 在Firefox+GM4中, 当返回缓存的页面时, 脚本会重新执行, 并且此时XMLHttpRequest是可修改的(为什么会这样?) + 页面中存在注入的代码
-        // 导致scriptSource的invokeBy直接是GM4...
-        log(`页面中存在注入的代码, 但invokeBy却等于${GM_info.scriptHandler}, 这种情况不合理, 终止脚本执行`)
-        return
-    }
-    if (document.readyState === 'uninitialized') { // Firefox上, 对于iframe中执行的脚本, 会出现这样的状态且获取到的href为about:blank...
-        log('invokeBy:', invokeBy, 'readState:', document.readyState, 'href:', location.href, '需要等待进入loading状态')
-        setTimeout(() => scriptSource(invokeBy + '.timeout'), 0) // 这里会暴力执行多次, 直到状态不为uninitialized...
-        return
-    }
-
-    log = util_debug
-    log(`[${GM_info.script.name} v${GM_info.script.version} (${invokeBy})] run on: ${window.location.href}`);
-
-    bili.version_remind()
-    bili.switch_to_old_player()
-
-    bili.area_limit_for_vue()
-
-    const balh_feature_area_limit = (function () {
+export const area_limit_xhr = (() => {
+    return function () {
         if (isClosed()) return
         injectFetch()
-        function injectXHR() {
-            util_debug('XMLHttpRequest的描述符:', Object.getOwnPropertyDescriptor(window, 'XMLHttpRequest'))
-            let firstCreateXHR = true
-            window.XMLHttpRequest = new Proxy(window.XMLHttpRequest, {
-                construct: function (target, args) {
-                    // 第一次创建XHR时, 打上断点...
-                    if (firstCreateXHR && r.script.is_dev) {
-                        firstCreateXHR = false
-                        // debugger
-                    }
-                    let container = {} // 用来替换responseText等变量
-                    const dispatchResultTransformer = p => {
-                        let event = {} // 伪装的event
-                        return p
-                            .then(r => {
-                                container.readyState = 4
-                                container.response = r
-                                container.responseText = typeof r === 'string' ? r : JSON.stringify(r)
-                                container.__onreadystatechange(event) // 直接调用会不会存在this指向错误的问题? => 目前没看到, 先这样(;¬_¬)
-                            })
-                            .catch(e => {
-                                // 失败时, 让原始的response可以交付
-                                container.__block_response = false
-                                if (container.__response != null) {
-                                    container.readyState = 4
-                                    container.response = container.__response
-                                    container.__onreadystatechange(event) // 同上
-                                }
-                            })
-                    }
-                    const dispatchResultTransformerCreator = () => {
-                        container.__block_response = true
-                        return dispatchResultTransformer
-                    }
-                    return new Proxy(new target(...args), {
-                        set: function (target, prop, value, receiver) {
-                            if (prop === 'onreadystatechange') {
-                                container.__onreadystatechange = value
-                                let cb = value
-                                value = function (event) {
-                                    if (target.readyState === 4) {
-                                        if (target.responseURL.match(RegExps.url('bangumi.bilibili.com/view/web_api/season/user/status'))
-                                            || target.responseURL.match(RegExps.url('api.bilibili.com/pgc/view/web/season/user/status'))) {
-                                            log('/season/user/status:', target.responseText)
-                                            let json = JSON.parse(target.responseText)
-                                            let rewriteResult = false
-                                            if (json.code === 0 && json.result) {
-                                                areaLimit(json.result.area_limit !== 0)
-                                                if (json.result.area_limit !== 0) {
-                                                    json.result.area_limit = 0 // 取消区域限制
-                                                    rewriteResult = true
-                                                }
-                                                if (balh_config.blocked_vip) {
-                                                    json.result.pay = 1
-                                                    rewriteResult = true
-                                                }
-                                                if (rewriteResult) {
-                                                    container.responseText = JSON.stringify(json)
-                                                }
-                                            }
-                                        } else if (target.responseURL.match(RegExps.url('bangumi.bilibili.com/web_api/season_area'))) {
-                                            log('/season_area', target.responseText)
-                                            let json = JSON.parse(target.responseText)
-                                            if (json.code === 0 && json.result) {
-                                                areaLimit(json.result.play === 0)
-                                                if (json.result.play === 0) {
-                                                    json.result.play = 1
-                                                    container.responseText = JSON.stringify(json)
-                                                }
-                                            }
-                                        } else if (target.responseURL.match(RegExps.url('api.bilibili.com/x/web-interface/nav'))) {
-                                            const isFromReport = Strings.getSearchParam(target.responseURL, 'from') === 'report'
-                                            let json = JSON.parse(target.responseText)
-                                            log('/x/web-interface/nav', (json.data && json.data.isLogin)
-                                                ? { uname: json.data.uname, isLogin: json.data.isLogin, level: json.data.level_info.current_level, vipType: json.data.vipType, vipStatus: json.data.vipStatus, isFromReport: isFromReport }
-                                                : target.responseText)
-                                            if (json.code === 0 && json.data && balh_config.blocked_vip
-                                                && !isFromReport // report时, 还是不伪装了...
-                                            ) {
-                                                json.data.vipType = 2; // 类型, 年度大会员
-                                                json.data.vipStatus = 1; // 状态, 启用
-                                                container.responseText = JSON.stringify(json)
-                                            }
-                                        } else if (target.responseURL.match(RegExps.url('api.bilibili.com/x/player.so'))) {
-                                            // 这个接口的返回数据貌似并不会影响界面...
-                                            if (balh_config.blocked_vip) {
-                                                log('/x/player.so')
-                                                const xml = new DOMParser().parseFromString(`<root>${target.responseText.replace(/\&/g, "&amp;")}</root>`, 'text/xml')
-                                                const vipXml = xml.querySelector('vip')
-                                                if (vipXml) {
-                                                    const vip = JSON.parse(vipXml.innerHTML)
-                                                    vip.vipType = 2 // 同上
-                                                    vip.vipStatus = 1
-                                                    vipXml.innerHTML = JSON.stringify(vip)
-                                                    container.responseText = xml.documentElement.innerHTML
-                                                    container.response = container.responseText
-                                                }
-                                            }
-                                        } else if (target.responseURL.match(RegExps.url('api.bilibili.com/x/player/v2'))) {
-                                            // 上一个接口的新版本
-                                            let json = JSON.parse(target.responseText);
-                                            // 生成字幕
-                                            if (balh_config.generate_sub && json.code == 0 && json.data.subtitle && json.data.subtitle.subtitles) {
-                                                let subtitles = json.data.subtitle.subtitles;
-                                                let lans = subtitles.map((item) => item.lan);
-                                                let genCN = lans.includes('zh-Hant') && !lans.includes('zh-CN');
-                                                let genHant = lans.includes('zh-CN') && !lans.includes('zh-Hant');
-                                                let origin = genCN ? 'zh-Hant' : genHant ? 'zh-CN' : null;
-                                                let target = genCN ? 'zh-CN' : genHant ? 'zh-Hant' : null;
-                                                let converter = genCN ? 't2cn' : genHant ? 'cn2t' : null;
-                                                let targetDoc = genCN ? '中文（中国）生成' : genHant ? '中文（繁体）生成' : null;
-                                                if (origin && target && converter && targetDoc) {
-                                                    let origSub = subtitles.find((item) => item.lan == origin);
-                                                    let origSubUrl = 'http:' + origSub.subtitle_url;
-                                                    let origSubId = origSub.id;
-                                                    let origSubRealId = BigInt(origSub.id_str);
-                                                    let encSubUrl = encodeURIComponent(origSubUrl);
-                                                    let encSubId = encodeURIComponent(origSub.id_str);
-                                                    let targetSub = {
-                                                        lan: target,
-                                                        lan_doc: targetDoc,
-                                                        is_lock: false,
-                                                        subtitle_url: `//www.kofua.top/bsub/${converter}?sub_url=${encSubUrl}&sub_id=${encSubId}`,
-                                                        type: 0,
-                                                        id: origSubId + 1,
-                                                        id_str: (origSubRealId + 1n).toString(),
-                                                    };
-                                                    json.data.subtitle.subtitles.push(targetSub);
-                                                    container.responseText = JSON.stringify(json);
-                                                }
-                                            }
-                                            // https://github.com/ipcjs/bilibili-helper/issues/775
-                                            // 适配有些泰区番剧有返回数据，但字幕为空的问题（ep372478）
-                                            /*
-                                            if (json.code == -404 || (json.code == 0 && window.__balh_app_only__ && json.data.subtitle.subtitles.length == 0)) {
-                                                log('/x/player/v2', '404', target.responseText);
-                                                container.__block_response = true;
-                                                let url = container.__url.replace('player/v2', 'v2/dm/view').replace('cid', 'oid') + '&type=1'; //从APP接口拉取字幕信息
-                                                Async.ajax(url).then(async data => {
-                                                    if (!data.code && data.data.subtitle) {
-                                                        // 使用APP接口获取的字幕信息重构返回数据，其它成员不明暂时无视
-                                                        const subtitle = data.data.subtitle;
-                                                        if (subtitle.subtitles) {
-                                                            subtitle.subtitles.forEach(item => (item.subtitle_url = item.subtitle_url.replace(/https?:\/\//, '//')));
-                                                        } else {
-                                                            // 泰区番剧返回的字幕为 null，需要使用泰区服务器字幕接口填充数据
-                                                            let thailand_sub_url = url.replace('https://api.bilibili.com/x/v2/dm/view', `${balh_config.server_custom_th}/intl/gateway/v2/app/subtitle`);
-                                                            let thailand_data = await Async.ajax(thailand_sub_url);
-                                                            subtitle.subtitles = [];
-                                                            thailand_data.data.subtitles.forEach((item) => {
-                                                                let sub = {
-                                                                    'id': item.id,
-                                                                    'id_str': item.id.toString(),
-                                                                    'lan': item.key,
-                                                                    'lan_doc': item.title,
-                                                                    'subtitle_url': item.url.replace(/https?:\/\//, '//')
-                                                                }
-                                                                subtitle.subtitles.push(sub);
-                                                            })
-                                                        }
-                                                        subtitle.allow_submit = false;
-                                                        json.data = { subtitle };
-                                                        json.code = 0;
-                                                        if (balh_config.blocked_vip) {
-                                                            json.data.vip = {
-                                                                type: 2, //年费大会员
-                                                                status: 1 //启用
-                                                            };
-                                                            log('/x/player/v2', 'vip');
-                                                        }
-                                                        log('/x/player/v2', 'rebuild', json);
-                                                    }
-                                                    container.responseText = JSON.stringify(json);
-                                                    container.response = container.responseText;
-                                                    cb.apply(container.responseText ? receiver : this, arguments);
-                                                }).catch(e => {
-                                                    util_error('/x/player/v2', e);
-                                                    cb.apply(this, arguments);
-                                                })
-                                            }
-                                            */
-                                            if ((json.code === -400 || json.code === -404 || (json.code == 0 && window.__balh_app_only__ && json.data.subtitle.subtitles.length == 0)) && balh_config.server_custom_th) {
-                                                // 泰区番剧返回的字幕为 null，需要使用泰区服务器字幕接口填充数据
-                                                // https://www.bilibili.com/bangumi/play/ep10649765
-                                                let thailand_sub_url = container.__url.replace('https://api.bilibili.com/x/player/v2', `${balh_config.server_custom_th}/intl/gateway/v2/app/subtitle`);
-                                                Async.ajax(thailand_sub_url)
-                                                    .then(async thailand_data => {
-                                                        let subtitle = { subtitles: [] };
-                                                        thailand_data.data.subtitles.forEach((item) => {
-                                                            let sub = {
-                                                                'id': item.id,
-                                                                'id_str': item.id.toString(),
-                                                                'lan': item.key,
-                                                                'lan_doc': item.title,
-                                                                'subtitle_url': item.url.replace(/https?:\/\//, '//')
-                                                            }
-                                                            subtitle.subtitles.push(sub);
-                                                        })
-                                                        let json = { code: 0, data: { subtitle: subtitle } };
-                                                        // todo: json.data中有许多字段, 需要想办法填充
-                                                        if (balh_config.blocked_vip) {
-                                                            json.data.vip = {
-                                                                type: 2, //年费大会员
-                                                                status: 1 //启用
-                                                            };
-                                                        }
-                                                        return json
-                                                    })
-                                                    .compose(dispatchResultTransformerCreator())
-                                            }
-                                            else if (!json.code && json.data && balh_config.blocked_vip) {
-                                                log('/x/player/v2', 'vip');
-                                                const vip = json.data.vip;
-                                                if (vip) {
-                                                    vip.type = 2; // 同上
-                                                    vip.status = 1;
-                                                    container.responseText = JSON.stringify(json);
-                                                    container.response = container.responseText;
-                                                }
-                                            }
-                                        } else if (target.responseURL.match(RegExps.url('api.bilibili.com/x/player/playurl'))) {
-                                            log('/x/player/playurl', 'origin', `block: ${container.__block_response}`, target.response)
-                                            // todo      : 当前只实现了r.const.mode.REPLACE, 需要支持其他模式
-                                            // 2018-10-14: 等B站全面启用新版再说(;¬_¬)
-                                        } else if (target.responseURL.match(RegExps.url('api.bilibili.com/pgc/player/web/playurl'))
-                                            && !Strings.getSearchParam(target.responseURL, 'balh_ajax')) {
-                                            log('/pgc/player/web/playurl', 'origin', `block: ${container.__block_response}`, target.response)
-                                            if (!container.__redirect) { // 请求没有被重定向, 则需要检测结果是否有区域限制
-                                                let json = typeof target.response === 'object' ? target.response : JSON.parse(target.responseText)
-                                                if (balh_config.blocked_vip || json.code || isAreaLimitForPlayUrl(json.result)) {
-                                                    areaLimit(true)
-                                                    container.__block_response = true
-                                                    let url = container.__url
-                                                    if (isBangumiPage()) {
-                                                        url += `&module=bangumi`
-                                                    }
-                                                    bilibiliApis._playurl.asyncAjax(url)
-                                                        .then(data => {
-                                                            if (!data.code) {
-                                                                data = { code: 0, result: data, message: "0" }
-                                                            }
-                                                            log('/pgc/player/web/playurl', 'proxy', data)
-                                                            return data
-                                                        })
-                                                        .compose(dispatchResultTransformer)
-                                                } else {
-                                                    areaLimit(false)
-                                                }
-                                            }
-                                            // 同上
-                                        } else if (target.responseURL.match(RegExps.url('api.bilibili.com/pgc/view/web/freya/season'))) {
-                                            /* 一起看放映室用这个api来识别区域限制 */
-                                            let json = JSON.parse(target.response)
-                                            log('/pgc/view/web/freya/season', 'origin', `area_limit`, json.data.viewUserStatus.area_limit)
-                                            if (json.code == 0 && json.data.viewUserStatus.area_limit == 1) {
-                                                areaLimit(true)
-                                                json.data.viewUserStatus.area_limit = 0
-                                                container.__block_response = true
-
-                                                container.responseText = JSON.stringify(json);
-                                                container.response = container.responseText;
-                                                cb.apply(container.responseText ? receiver : this, arguments);
-                                            } else {
-                                                areaLimit(false)
-                                            }
-                                        } else if (target.responseURL.match(RegExps.url('api.bilibili.com/x/space/acc/info?'))) {
-                                            const json = JSON.parse(target.responseText)
-                                            if (json.code === -404) {
-                                                const mid = new URL(target.responseURL).searchParams.get('mid')
-                                                if (space_account_info_map[mid]) {
-                                                    container.responseText = JSON.stringify(space_account_info_map[mid])
-                                                }
-                                            }
-                                        }
-                                        if (container.__block_response) {
-                                            // 屏蔽并保存response
-                                            container.__response = target.response
-                                            return
-                                        }
-                                    }
-                                    // 这里的this是原始的xhr, 在container.responseText设置了值时需要替换成代理对象
-                                    cb.apply(container.responseText ? receiver : this, arguments)
-                                }
-                            }
-                            target[prop] = value
-                            return true
-                        },
-                        get: function (target, prop, receiver) {
-                            if (prop in container) return container[prop]
-                            let value = target[prop]
-                            if (typeof value === 'function') {
-                                let func = value
-                                // open等方法, 必须在原始的xhr对象上才能调用...
-                                value = function () {
-                                    if (prop === 'open') {
-                                        container.__method = arguments[0]
-                                        container.__url = arguments[1]
-                                    } else if (prop === 'send') {
-                                        if (container.__url.match(RegExps.url('api.bilibili.com/x/player/playurl')) && balh_config.enable_in_av) {
-                                            log('/x/player/playurl')
-                                            // debugger
-                                            bilibiliApis._playurl.asyncAjax(container.__url)
-                                                .then(data => {
-                                                    if (!data.code) {
-                                                        data = {
-                                                            code: 0,
-                                                            data: data,
-                                                            message: "0",
-                                                            ttl: 1
-                                                        }
-                                                    }
-                                                    log('/x/player/playurl', 'proxy', data)
-                                                    return data
-                                                })
-                                                .compose(dispatchResultTransformerCreator())
-                                        } else if (container.__url.match(RegExps.url('api.bilibili.com/pgc/player/web/playurl'))
-                                            && !Strings.getSearchParam(container.__url, 'balh_ajax')
-                                            && needRedirect()) {
-                                            log('/pgc/player/web/playurl')
-                                            // debugger
-                                            container.__redirect = true // 标记该请求被重定向
-                                            let url = container.__url
-                                            if (isBangumiPage()) {
-                                                url += `&module=bangumi`
-                                            }
-                                            bilibiliApis._playurl.asyncAjax(url)
-                                                .then(data => {
-                                                    if (!data.code) {
-                                                        data = {
-                                                            code: 0,
-                                                            result: data,
-                                                            message: "0",
-                                                        }
-                                                    }
-                                                    log('/pgc/player/web/playurl', 'proxy(redirect)', data)
-                                                    return data
-                                                })
-                                                .compose(dispatchResultTransformerCreator())
-                                        }
-                                    }
-                                    return func.apply(target, arguments)
-                                }
-                            }
-                            return value
+        function injectXhr() {
+            injectXhrImpl({
+                /// {@template xhr_transform_response}
+                /// 转换响应数据, 处理简单的情况
+                /// - url: 响应的url
+                /// - response: 响应内容
+                /// - xhr: xhr对象
+                /// - container, 一个xhr对象, 对应一个container, 可以用来复写xhr对象本身的属性, 或者设置一些临时的属性, 方便其他地方访问
+                /// 
+                /// 返回值可以是如下值:
+                /// - null, 表示不转换
+                /// - Promise, 异步转换
+                /// - object|string, 同步转换
+                /// {@endtemplate}
+                transformResponse: ({ url, response, xhr, container }) => {
+                    if (url.match(RegExps.url('api.bilibili.com/pgc/view/web/season?'))) {
+                        let json = JSON.parse(xhr.responseText)
+                        if (json.code === 0 && json.result) {
+                            // processSeasonInfo(json.result)
+                            json.result.episodes.forEach(removeEpAreaLimit)
+                            json.result.rights.area_limit = 0
+                            json.result.rights.ban_area_show = 0
+                            return json
                         }
-                    })
+                    } else if (url.match(RegExps.url('bangumi.bilibili.com/view/web_api/season/user/status'))
+                        || url.match(RegExps.url('api.bilibili.com/pgc/view/web/season/user/status'))) {
+                        let json = JSON.parse(xhr.responseText)
+                        let rewriteResult = false
+                        if (json.code === 0 && json.result) {
+                            areaLimit(json.result.area_limit !== 0)
+                            if (json.result.area_limit !== 0) {
+                                json.result.area_limit = 0 // 取消区域限制
+                                json.result.ban_area_show = 0
+                                rewriteResult = true
+                            }
+                            if (balh_config.blocked_vip) {
+                                json.result.pay = 1
+                                rewriteResult = true
+                            }
+                            if (rewriteResult) {
+                                return json
+                            }
+                        }
+                    } else if (url.match(RegExps.url('bangumi.bilibili.com/web_api/season_area'))) {
+                        log('/season_area', url)
+                        let json = JSON.parse(xhr.responseText)
+                        if (json.code === 0 && json.result) {
+                            areaLimit(json.result.play === 0)
+                            if (json.result.play === 0) {
+                                json.result.play = 1
+                                return json
+                            }
+                        }
+                    } else if (url.match(RegExps.url('api.bilibili.com/x/web-interface/nav'))) {
+                        const isFromReport = Strings.getSearchParam(url, 'from') === 'report'
+                        let json = JSON.parse(xhr.responseText)
+                        log('/x/web-interface/nav', (json.data && json.data.isLogin)
+                            ? { uname: json.data.uname, isLogin: json.data.isLogin, level: json.data.level_info.current_level, vipType: json.data.vipType, vipStatus: json.data.vipStatus, isFromReport: isFromReport }
+                            : xhr.responseText)
+                        if (json.code === 0 && json.data && balh_config.blocked_vip
+                            && !isFromReport // report时, 还是不伪装了...
+                        ) {
+                            json.data.vipType = 2; // 类型, 年度大会员
+                            json.data.vipStatus = 1; // 状态, 启用
+                            return json
+                        }
+                    } else if (url.match(RegExps.url('api.bilibili.com/x/player.so'))) {
+                        // 这个接口的返回数据貌似并不会影响界面...
+                        if (balh_config.blocked_vip) {
+                            log('/x/player.so')
+                            const xml = new DOMParser().parseFromString(`<root>${xhr.responseText.replace(/\&/g, "&amp;")}</root>`, 'text/xml')
+                            const vipXml = xml.querySelector('vip')
+                            if (vipXml) {
+                                const vip = JSON.parse(vipXml.innerHTML)
+                                vip.vipType = 2 // 同上
+                                vip.vipStatus = 1
+                                vipXml.innerHTML = JSON.stringify(vip)
+                                return xml.documentElement.innerHTML
+                            }
+                        }
+                    } else if (url.match(RegExps.url('api.bilibili.com/x/player/v2'))) {
+                        // 上一个接口的新版本
+                        let json = JSON.parse(xhr.responseText);
+                        // 生成简体字幕
+                        if (balh_config.generate_sub && json.code == 0 && json.data.subtitle?.subtitles?.length) {
+                            const subtitles = json.data.subtitle.subtitles;
+                            const lans = subtitles.map((item) => item.lan);
+                            const genHans = lans.includes('zh-Hant') && !lans.includes('zh-Hans');
+                            const genHant = lans.includes('zh-Hans') && !lans.includes('zh-Hant');
+                            if (genHans || genHant) {
+                                const origin = genHans ? 'zh-Hant' : 'zh-Hans';
+                                const target = genHans ? 'zh-Hans' : 'zh-Hant';
+                                const targetDoc = genHans ? '中文（简体）生成' : '中文（繁体）生成'
+                                if (origin && target && targetDoc) {
+                                    const from = origin == 'zh-Hant' ? 'tw' : 'cn';
+                                    const to = target == 'zh-Hans' ? 'cn' : 'tw';
+                                    const origSub = subtitles.find((item) => item.lan == origin);
+                                    const origSubUrl = 'https:' + origSub.subtitle_url;
+                                    const origSubId = origSub.id;
+                                    const origSubRealId = BigInt(origSub.id_str);
+                                    const translateUrl = new URL(origSubUrl);
+                                    translateUrl.searchParams.set('translate', '1');
+                                    translateUrl.searchParams.set('from', from);
+                                    translateUrl.searchParams.set('to', to);
+                                    const targetSub = {
+                                        lan: target,
+                                        lan_doc: targetDoc,
+                                        is_lock: false,
+                                        subtitle_url: translateUrl.href,
+                                        type: 0,
+                                        id: origSubId + 1,
+                                        id_str: (origSubRealId + 1n).toString(),
+                                    };
+                                    json.data.subtitle.subtitles.push(targetSub);
+                                }
+                            }
+                        }
+                        if ((json.code === -400 || json.code === -404 || (json.code == 0 && window.__balh_app_only__ && json.data.subtitle.subtitles.length == 0)) && balh_config.server_custom_th) {
+                            // 泰区番剧返回的字幕为 null，需要使用泰区服务器字幕接口填充数据
+                            // https://www.bilibili.com/bangumi/play/ep10649765
+                            // 2022-09-17 ipcjs: 为什么这里用的是请求url, 而不是响应url?...
+                            let requestUrl = container.__url
+                            let thailand_sub_url = requestUrl.replace('https://api.bilibili.com/x/player/v2', `${balh_config.server_custom_th}/intl/gateway/v2/app/subtitle`);
+                            return Async.ajax(thailand_sub_url)
+                                .then(async thailand_data => {
+                                    let subtitle = { subtitles: [] };
+                                    thailand_data.data.subtitles.forEach((item) => {
+                                        let sub = {
+                                            'id': item.id,
+                                            'id_str': item.id.toString(),
+                                            'lan': item.key,
+                                            'lan_doc': item.title,
+                                            'subtitle_url': item.url.replace(/https?:\/\//, '//')
+                                        }
+                                        subtitle.subtitles.push(sub);
+                                    })
+                                    if (json.code === 0) {
+                                        json.data.subtitle = subtitle
+                                    } else {
+                                        json = { code: 0, "message": "0", data: { subtitle: subtitle } }
+                                    }
+                                    // todo: json.data中有许多字段, 需要想办法填充
+                                    if (balh_config.blocked_vip) {
+                                        json.data.vip = {
+                                            type: 2, //年费大会员
+                                            status: 1 //启用
+                                        };
+                                    }
+                                    return json
+                                })
+                        } else if (!json.code && json.data && balh_config.blocked_vip) {
+                            log('/x/player/v2', 'vip');
+                            const vip = json.data.vip;
+                            if (vip) {
+                                vip.type = 2; // 同上
+                                vip.status = 1;
+                            }
+                        }
+                        return json
+                    } else if (url.match(RegExps.urlPath('/bfs/subtitle/'))) {
+                        log('/bfs/subtitle', url);
+                        const parsedUrl = new URL(url);
+                        const translate = parsedUrl.searchParams.get('translate') == '1';
+                        if (!translate) {
+                            return null;
+                        }
+                        const from = parsedUrl.searchParams.get('from');
+                        const to = parsedUrl.searchParams.get('to');
+                        const translator = OpenCC.Converter({ from: from, to: to });
+                        const json = JSON.parse(xhr.responseText);
+
+                        // 参考 https://github.com/Kr328/bilibili-subtitle-tweaks
+                        json.body.forEach((value) => {
+                            const original = value.content;
+
+                            let result = original.replace(/\s[-—－]/, s => `\n${s.substring(1)}`);
+                            result = translator(result);
+                            value.content = result;
+                        });
+                        return json;
+                    } else if (url.match(RegExps.url('api.bilibili.com/x/player/playurl'))) {
+                        log('/x/player/playurl', 'origin', `block: ${container.__block_response}`, xhr.response)
+                        // todo      : 当前只实现了r.const.mode.REPLACE, 需要支持其他模式
+                        // 2018-10-14: 等B站全面启用新版再说(;¬_¬)
+                    } else if (url.match(RegExps.url('api.bilibili.com/pgc/player/web/playurl')) || url.match(RegExps.url('api.bilibili.com/pgc/player/web/v2/playurl'))
+                        && !Strings.getSearchParam(url, 'balh_ajax')) {
+                        const reqUrl = new URL(url, document.location.href)
+                        const isV1 = reqUrl.pathname === '/pgc/player/web/playurl'
+                        let json = typeof xhr.response === 'object' ? xhr.response : JSON.parse(xhr.responseText)
+                        if (!container.__redirect || (!isV1 && isAreaLimitForPlayUrl(json.result))) { // 请求没有被重定向, 则需要检测结果是否有区域限制
+                            if (balh_config.blocked_vip || json.code || isAreaLimitForPlayUrl(json.result)) {
+                                areaLimit(true)
+                                // 2022-09-17 ipcjs: 为什么这里用的是请求url, 而不是响应url?...
+                                let requestUrl = isV1 ? container.__url : `//api.bilibili.com/pgc/player/web/playurl${reqUrl.search}`
+                                if (isBangumiPage()) {
+                                    requestUrl += `&module=bangumi`
+                                }
+                                return bilibiliApis._playurl.asyncAjax(requestUrl)
+                                    .then(data => {
+                                        if (!data.code) {
+                                            data = isV1
+                                                ? { code: 0, result: data, message: "0" }
+                                                : { code: 0, message: "success", result: { video_info: data } }
+                                        }
+                                        return data
+                                    })
+                            } else {
+                                areaLimit(false)
+                            }
+                        }
+                        // 同上
+                    } else if (url.match(RegExps.url('api.bilibili.com/pgc/view/web/freya/season'))) {
+                        /* 一起看放映室用这个api来识别区域限制 */
+                        let json = JSON.parse(xhr.response)
+                        log('/pgc/view/web/freya/season', 'origin', `area_limit`, json.data.viewUserStatus.area_limit)
+                        if (json.code == 0 && json.data.viewUserStatus.area_limit == 1) {
+                            areaLimit(true)
+                            json.data.viewUserStatus.area_limit = 0
+                            return json
+                        } else {
+                            areaLimit(false)
+                        }
+                    } else if (url.match(RegExps.url('api.bilibili.com/x/space/acc/info?')) || url.match(RegExps.url('api.bilibili.com/x/space/wbi/acc/info?'))) {
+                        const json = JSON.parse(xhr.responseText)
+                        if (json.code === -404) {
+                            const mid = new URL(url).searchParams.get('mid')
+                            if (space_account_info_map[mid]) {
+                                return space_account_info_map[mid]
+                            }
+                        }
+                    }
+                    return null
+                },
+                /// {@template xhr_transform_request}
+                /// 转换请求
+                /// - url, 请求链接
+                /// - container, 一个xhr对象, 对应一个container, 可以用来复写xhr对象本身的属性, 或者设置一些临时的属性, 方便其他地方访问
+                /// 
+                /// 返回值可以是如下值:
+                /// - null, 表示不处理
+                /// - Promise, 表示需要替换成异步请求, Promise的结果会替换xhr.response
+                /// {@endtemplate}
+                transformRequest: ({ url, container }) => {
+                    if (url.match(RegExps.url('api.bilibili.com/x/player/playurl')) && balh_config.enable_in_av) {
+                        log('/x/player/playurl')
+                        // debugger
+                        return bilibiliApis._playurl.asyncAjax(url)
+                            .then(data => {
+                                if (!data.code) {
+                                    data = {
+                                        code: 0,
+                                        data: data,
+                                        message: "0",
+                                        ttl: 1
+                                    }
+                                }
+                                log('/x/player/playurl', 'proxy', data)
+                                return data
+                            })
+
+                    } else if (url.match(RegExps.url('api.bilibili.com/pgc/player/web/playurl'))
+                        && !Strings.getSearchParam(url, 'balh_ajax')
+                        && needRedirect()) {
+                        // debugger
+                        container.__redirect = true // 标记该请求被重定向
+                        if (isBangumiPage()) {
+                            url += `&module=bangumi`
+                        }
+                        return bilibiliApis._playurl.asyncAjax(url)
+                            .then(data => {
+                                if (!data.code) {
+                                    data = { code: 0, result: data, message: "0" }
+                                }
+                                return data
+                            })
+                    }
+                    return null
                 }
             })
         }
@@ -420,7 +332,6 @@ function scriptContent() {
                 let oriResultTransformer
                 let oriResultTransformerWhenProxyError
                 let one_api;
-                // log(param)
                 if (param.url.match(RegExps.urlPath('/web_api/get_source'))) {
                     one_api = bilibiliApis._get_source;
                     oriResultTransformer = p => p
@@ -455,7 +366,6 @@ function scriptContent() {
                             param.data = undefined
                         }
                         if (isBangumiPage()) {
-                            log(`playurl add 'module=bangumi' param`)
                             param.url += `&module=bangumi`
                         }
                         // 加上这个参数, 防止重复拦截这个url
@@ -468,7 +378,6 @@ function scriptContent() {
                     }
                     oriResultTransformer = p => p
                         .then(json => {
-                            log(json)
                             if (isNewPlayurl && !json.code) {
                                 json = json.result
                             }
@@ -619,7 +528,8 @@ function scriptContent() {
         }
 
         function isBangumiPage() {
-            return isBangumi(Func.safeGet('window.__INITIAL_STATE__.mediaInfo.season_type || window.__INITIAL_STATE__.mediaInfo.ssType'))
+            const mediaInfo = window.__INITIAL_STATE__?.mediaInfo || window.__NEXT_DATA__?.props.pageProps.dehydratedState?.queries[0]?.state.data.seasonInfo?.mediaInfo
+            return isBangumi(mediaInfo?.season_type || mediaInfo?.ssType)
         }
 
         function getSeasonId() {
@@ -688,7 +598,7 @@ function scriptContent() {
         }
 
         function isAreaLimitForPlayUrl(json) {
-            return (json.errorcid && json.errorcid == '8986943') || (json.durl && json.durl.length === 1 && json.durl[0].length === 15126 && json.durl[0].size === 124627);
+            return (json.errorcid && json.errorcid == '8986943') || (json.durl && json.durl.length === 1 && json.durl[0].length === 15126 && json.durl[0].size === 124627) || !json.video_info;
         }
 
         var bilibiliApis = (function () {
@@ -894,11 +804,11 @@ function scriptContent() {
                         } else {
                             return Promise.reject(new AjaxException(`服务器错误: ${JSON.stringify(data)}`, data ? data.code : 0))
                         }
-                    } else if (isAreaLimitForPlayUrl(data)) {
+                    } else if (isAreaLimitForPlayUrl(data) || data.code === 401) {
                         util_error('>>area limit');
                         ui.pop({
-                            content: `突破黑洞失败\n需要登录\n点此确定进行登录`,
-                            onConfirm: bili.biliplus_login.showLogin
+                            content: `突破黑洞失败\n${data.message}\n需要登录\n点此确定进行登录`,
+                            onConfirm: bilibili_login.showLogin
                         })
                     } else {
                         if (balh_config.flv_prefer_ws) {
@@ -984,14 +894,14 @@ function scriptContent() {
                     }
 
                     // 标题有明确说明优先尝试，通常准确率最高
-                    if (document.title.includes('僅限台灣') && balh_config.server_custom_tw) {
+                    if (/(僅|仅)限?(臺|台)(灣|湾)/.test(document.title) && balh_config.server_custom_tw) {
                         ui.playerMsg('捕获标题提示，使用台湾代理服务器拉取视频地址...')
                         result = await requestPlayUrl(balh_config.server_custom_tw, 'tw')
                         if (!result.code) {
                             return Promise.resolve(result)
                         }
                     }
-                    if (document.title.includes('僅限港澳') && balh_config.server_custom_hk) {
+                    if (/(僅|仅)限?港澳/.test(document.title) && balh_config.server_custom_hk) {
                         ui.playerMsg('捕获标题提示，使用香港代理服务器拉取视频地址...')
                         result = await requestPlayUrl(balh_config.server_custom_hk, 'hk')
                         if (!result.code) {
@@ -1196,7 +1106,7 @@ function scriptContent() {
                 });
             })
         }
-        injectXHR();
+        injectXhr()
         if (true) {
             let jQuery = window.jQuery;
             if (jQuery) { // 若已加载jQuery, 则注入
@@ -1245,68 +1155,5 @@ function scriptContent() {
                 }
             });
         }
-    }())
-
-    bili.remove_pre_ad()
-
-    bili.check_html5()
-
-    bili.redirect_to_bangumi_or_insert_player()
-
-    bili.fill_season_page()
-
-    const settings = bili.settings()
-
-    bili.jump_to_baipiao()
-    bili.biliplus_check_area_limit()
-
-    function main() {
-        util_info(
-            'mode:', balh_config.mode,
-            'blocked_vip:', balh_config.blocked_vip,
-            'server:', balh_config.server,
-            'upos_server:', balh_config.upos_server,
-            'flv_prefer_ws:', balh_config.flv_prefer_ws,
-            'remove_pre_ad:', balh_config.remove_pre_ad,
-            'generate_sub:', balh_config.generate_sub,
-            'enable_in_av:', balh_config.enable_in_av,
-            'readyState:', document.readyState,
-            'isLogin:', bili.biliplus_login.isLogin(),
-            'isLoginBiliBili:', bili.biliplus_login.isLoginBiliBili()
-        )
-        // 暴露接口
-        window.bangumi_area_limit_hack = {
-            setCookie: cookieStorage.set,
-            getCookie: cookieStorage.get,
-            login: bili.biliplus_login.showLogin,
-            logout: bili.biliplus_login.showLogout,
-            getLog: (...args) => {
-                setTimeout(() => {
-                    util_warn('日志包含access_key等敏感数据, 请不要发给不信任的人!')
-                }, 0)
-                return logHub.getAllMsg.apply(null, args)
-            },
-            showSettings: settings.show,
-            _setupSettings: settings.setup,
-            set1080P: function () {
-                const settings = JSON.parse(localStorage.bilibili_player_settings)
-                const oldQuality = settings.setting_config.defquality
-                util_debug(`defauality: ${oldQuality}`)
-                settings.setting_config.defquality = 112 // 1080P
-                localStorage.bilibili_player_settings = JSON.stringify(settings)
-                location.reload()
-            },
-            _clear_local_value: function () {
-                delete localStorage.oauthTime
-                delete localStorage.balh_h5_not_first
-                delete localStorage.balh_old_isLoginBiliBili
-                delete localStorage.balh_must_remind_login_v3
-                delete localStorage.balh_must_updateLoginFlag
-            }
-        }
     }
-
-    main();
-}
-
-scriptContent();
+})()

@@ -9,9 +9,19 @@ export function redirect_to_bangumi_or_insert_player() {
     // 重定向到Bangumi页面， 或者在当前页面直接插入播放页面
     function tryRedirectToBangumiOrInsertPlayer() {
         let $errorPanel;
-        if (!($errorPanel = document.querySelector('.error-container > .error-panel'))) {
+        $errorPanel = document.querySelector('.error-container > .error-panel')
+        if (!$errorPanel && !window.__INITIAL_STATE__) {
+            // 新版视频不见了页面, 错误面板也是用Vue写的, 只能通过是否存在__INITIAL_STATE__来判断是不是错误页面
+            // eg: https://www.bilibili.com/video/BV1ja411X7Ba
+            $errorPanel = _('div', { style: { position: 'fixed', top: '100px', left: '100px' } });
+            document.body.appendChild($errorPanel);
+        }
+        if (!$errorPanel) {
             return;
         }
+        // 自动点击"取消跳转按钮"
+        let $goHomeBtn = document.querySelector<HTMLElement>(".big-btn.go-home");
+        $goHomeBtn?.click();
         let msg = document.createElement('a');
         $errorPanel.insertBefore(msg, $errorPanel.firstChild);
         msg.innerText = '获取番剧页Url中...';
@@ -45,8 +55,14 @@ export function redirect_to_bangumi_or_insert_player() {
                     // return Promise.reject('该AV号不属于任何番剧页');//No bangumi in api response
                 } else {
                     // 当前av属于番剧页面, 继续处理
-                    season_id = data.bangumi.season_id;
-                    return BiliPlusApi.season(season_id);
+                    if (data.bangumi.ogv_play_url) {
+                        // 有url直接跳转，不再请求一次了，顺带解决集数定位不对的问题
+                        msg.innerText = '即将跳转到：' + data.bangumi.ogv_play_url
+                        location.href = data.bangumi.ogv_play_url
+                    } else {
+                        season_id = data.bangumi.season_id;
+                        return BiliPlusApi.season(season_id);
+                    }
                 }
             })
             .then(function (result) {
@@ -82,6 +98,7 @@ export function redirect_to_bangumi_or_insert_player() {
                     episode_id = ep_id_by_cid || ep_id_by_aid_page || ep_id_by_aid
                 }
                 if (episode_id) {
+                    // FIXME: 这种地址有可能不能定位到正确的集数
                     let bangumi_url = `//www.bilibili.com/bangumi/play/ss${season_id}#${episode_id}`
                     log('Redirect', 'aid:', aid, 'page:', page, 'cid:', cid, '==>', bangumi_url, 'season_id:', season_id, 'ep_id:', episode_id)
                     msg.innerText = '即将跳转到：' + bangumi_url

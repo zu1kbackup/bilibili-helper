@@ -142,27 +142,58 @@
 }
 
 /* 列表Item上的按钮 */
-.ShareMenu {
-    display: none;
-}
 .ContentItem-action {
     margin-left: 8px;
 }
+/*
+// 测试按钮的选择器
+.ContentItem-actions button.Button--withLabel,
+button.ContentItem-action {
+    color: red;
+}
+*/
 
 /* 专栏页面 */
-.Post-NormalMain .Post-Header,
-.Post-NormalMain > div {
-    width: 100%;
+.Post {
+    &-content {
+        min-width: unset;
+    }
+    &-Main {
+        padding: 0px 16px;
+    }
+    &-NormalSub > div,
+    &-NormalMain > .Post-Header,
+    &-NormalMain > div {
+        width: 100%;
+    }
 }
-.ColumnPageHeader-content {
-    width: 100%;
+/* 专栏主页的Header */
+.ColumnPageHeader {
+    &-content {
+        width: calc(100% - 32px);
+        padding: 0px 16px;
+    }
+    &-profile {
+        display: none;
+    }
+    &-WriteButton {
+        font-size: 0px;
+    }
 }
+
 /* 弹窗 */
+button.Button.css-1x9te0t,
 .Modal-closeButton {
     position: static;
     margin-left: auto;
     margin-right: auto;
 }
+div.css-1bkecgh,
 .Modal {
     width: 100%;
+}
+
+/* 追踪水印, https://twitter.com/undef_i/status/1566315374765031424 */
+#root > div > div[class^="css-"] {
+    display: none;
 }

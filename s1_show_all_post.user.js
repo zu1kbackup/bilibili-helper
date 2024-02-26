@@ -1,18 +1,21 @@
 // ==UserScript==
 // @name        列出S1一条帖子的所有内容
 // @namespace   https://github.com/ipcjs
-// @version     0.3.0
+// @version     1.3.2
 // @description 在帖子的导航栏添加[显示全部]按钮, 列出帖子的所有内容
 // @author       ipcjs
 // @include     *://bbs.saraba1st.com/2b/thread-*-*-*.html
 // @include     *://bbs.saraba1st.com/2b/forum.php*
 // @grant       GM_xmlhttpRequest
 // @grant       GM.xmlHttpRequest
+// @grant       GM.setClipboard
+// @grant       GM_setClipboard
 // @grant       GM_addStyle
 // @grant       GM.addStyle
 // @grant       unsafeWindow
 // @connect     bbs.saraba1st.com
-// @require  https://greasemonkey.github.io/gm4-polyfill/gm4-polyfill.js
+// @require     https://greasemonkey.github.io/gm4-polyfill/gm4-polyfill.js
+// @run-at      document-start
 // ==/UserScript==
 
 // type, props, children
@@ -162,7 +165,6 @@ switch (TID) {
     default: filter = f_all; break;
 }
 
-document.querySelector('#pt > div.z').appendChild(_('a', { id: 'load-all-post', href: 'javascript:;', event: { click: () => loadAllPost() } }, '[显示全部]'));
 GM.addStyle(`
     #ssap-table tr {
 	    border-top: 1px solid #888; 
@@ -283,3 +285,65 @@ function f_1494926(item) {
 function f_all() {
     return true;
 }
+
+function feature_show_all() {
+    document.querySelector('#pt > div.z').appendChild(_('a', { id: 'load-all-post', href: 'javascript:;', event: { click: () => loadAllPost() } }, '[显示全部]'));
+}
+
+function feature_voters() {
+    const SEPARATOR = '\t'
+
+    async function copyVoters() {
+        const $button = this
+        const $content = document.getElementById('fwin_content_viewvote')
+        /** @type {HTMLSelectElement}  */
+        const $select = $content.querySelector('select.ps')
+        let result = '# 投票结果'
+        for (const [index, option] of Array.from($select.options).entries()) {
+            $button.textContent = `[复制中(${index}/${$select.options.length})...]`
+            result += `\n\n## ${option.text}`
+            log(option.value, option.text)
+            let page = 0
+            let $next
+            do {
+                page++
+                const resp = await ajaxPromise({ url: `https://bbs.saraba1st.com/2b/forum.php?mod=misc&action=viewvote&tid=${TID}&polloptionid=${option.value}&infloat=yes&handlekey=viewvote&page=${page}&inajax=1&ajaxtarget=fwin_content_viewvote` })
+                const $xml = new DOMParser().parseFromString(resp.responseXML.documentElement.firstChild.textContent, 'text/html')
+                const $voters = Array.from($xml.querySelectorAll('li > p > a'))
+
+                result += page > 1 ? SEPARATOR : '\n\n'
+                result += $voters.map(it => it.textContent).join(SEPARATOR)
+
+                $next = $xml.querySelector('.pg > .nxt')
+            } while ($next)
+
+        }
+        log(result)
+        GM.setClipboard(result)
+        $button.textContent = '[复制完成!]'
+    }
+    new MutationObserver((mutations, observer) => {
+        for (let m of mutations) {
+            for (let node of m.addedNodes) {
+                if (node.nodeType === Node.ELEMENT_NODE) {
+                    /** @type {HTMLDivElement}  */
+                    const $title = node.id === 'fctrl_viewvote' ? node : node.querySelector('#fctrl_viewvote')
+                    let $button = node.querySelector('#ssap_copy_voters')
+                    if ($title && !$button) {
+                        log($title)
+                        $button = _('a', { id: 'ssap_copy_voters', href: 'javascript:;', event: { click: copyVoters } }, '[复制结果]')
+                        $title.insertBefore($button, $title.lastChild)
+                    }
+                }
+            }
+        }
+    }).observe(document.getElementById('append_parent'), {
+        childList: true,
+        subtree: true,
+    })
+}
+
+unsafeWindow.addEventListener('DOMContentLoaded', (event) => {
+    feature_show_all()
+    feature_voters()
+})

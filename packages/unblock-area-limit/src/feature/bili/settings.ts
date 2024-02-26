@@ -6,7 +6,8 @@ import { balh_config } from "../config"
 import { util_page } from "../page"
 import { r } from "../r"
 import { util_ui_msg } from '../../util/message'
-import { biliplus_login } from "./biliplus_login"
+import { bilibili_login } from "./bilibili_login"
+import css from './settings.scss'
 
 const balh_feature_runPing = function () {
     const pingOutput = document.getElementById('balh_server_ping');
@@ -152,7 +153,7 @@ export function settings() {
 
     // 往顶层窗口发显示设置的请求
     function showSettings() {
-        window.top.postMessage('balh-show-setting', '*')
+        window.top?.postMessage('balh-show-setting', '*')
     }
 
     // 只有顶层窗口才接收请求
@@ -170,10 +171,10 @@ export function settings() {
         switch ((event.target as any).attributes['data-sign'].value) {
             default:
             case 'in':
-                biliplus_login.showLogin();
+                bilibili_login.showLogin();
                 break;
             case 'out':
-                biliplus_login.showLogout();
+                bilibili_login.showLogout();
                 break;
         }
     }
@@ -251,7 +252,7 @@ export function settings() {
     let customCNServerCheckText: HTMLElement
     let customTHServerCheckText: HTMLElement
     var settingsDOM = _('div', { id: 'balh-settings', style: { position: 'fixed', top: 0, bottom: 0, left: 0, right: 0, background: 'rgba(0,0,0,.7)', animationName: 'balh-settings-bg', animationDuration: '.5s', zIndex: 10000, cursor: 'pointer' }, event: { click: function (e: any) { if (e.target === this) util_ui_msg.close(), document.body.style.overflow = '', (this as any).remove(); } } }, [
-        _('style', {}, [_('text', r.css.settings)]),
+        _('style', {}, [_('text', css)]),
         _('div', { style: { position: 'absolute', background: '#FFF', borderRadius: '10px', padding: '20px', top: '50%', left: '50%', width: '600px', transform: 'translate(-50%,-50%)', cursor: 'default' } }, [
             _('h1', {}, [_('text', `${GM_info.script.name} v${GM_info.script.version} 参数设置`)]),
             _('br'),
@@ -261,8 +262,7 @@ export function settings() {
                 _('text', '代理服务器：'), _('a', { href: 'javascript:', event: { click: balh_feature_runPing } }, [_('text', '测速')]), _('br'),
                 _('div', { style: { display: 'flex' } }, [
                     // _('label', { style: { flex: 1 } }, [_('input', { type: 'radio', name: 'balh_server_inner', value: r.const.server.S0 }), _('text', '土豆服')]),
-                    _('label', { style: { flex: 1 } }, [_('input', { type: 'radio', disabled: 'true', name: 'balh_server_inner', value: r.const.server.S1 }), _('text', 'BiliPlus'), _('a', { href: 'https://www.biliplus.com/?about' }, [_('text', '（捐赠）')]),
-                    ]),
+                    // _('label', { style: { flex: 1 } }, [_('input', { type: 'radio', disabled: 'true', name: 'balh_server_inner', value: r.const.server.S1 }), _('text', 'BiliPlus'), _('a', { href: 'https://www.biliplus.com/?about' }, [_('text', '（捐赠）')]), ]),
                     _('label', { style: { flex: 2 } }, [
                         _('input', { type: 'radio', name: 'balh_server_inner', value: r.const.server.CUSTOM }), _('text', `自定义（首选服务器）`),
                         _('input', {
@@ -354,11 +354,11 @@ export function settings() {
                                 }
                             }, [
                                 _('option', { value: "" }, [_('text', '不替换')]),
+                                _('option', { value: "ali" }, [_('text', 'ali（阿里）')]),
                                 _('option', { value: "ks3" }, [_('text', 'ks3（金山）')]),
                                 _('option', { value: "kodo" }, [_('text', 'kodo（七牛）')]),
                                 _('option', { value: "cos" }, [_('text', 'cos（腾讯）')]),
                                 _('option', { value: "bos" }, [_('text', 'bos（百度）')]),
-                                _('option', { value: "wcs" }, [_('text', 'wcs（网宿）')]),
                                 _('option', { value: "hw" }, [_('text', 'hw（251）')]),
                             ]),
                             _('span', { 'id': 'upos-server-message' })
@@ -390,7 +390,7 @@ export function settings() {
                 ]), _('br'),
                 _('a', { href: 'javascript:', 'data-sign': 'in', event: { click: onSignClick } }, [_('text', '帐号授权')]),
                 _('text', '　'),
-                _('a', { href: 'javascript:', 'data-sign': 'out', event: { click: onSignClick } }, [_('text', '取消授权')]),
+                bilibili_login.isLogin() ? _('a', { href: 'javascript:', 'data-sign': 'out', event: { click: onSignClick } }, [_('text', '取消授权')]) : _('span'),
                 _('text', '　　'),
                 _('a', { href: 'javascript:', event: { click: function () { util_ui_msg.show(window.$(this), '如果你的帐号进行了付费，不论是大会员还是承包，\n进行授权之后将可以在解除限制时正常享有这些权益\n\n你可以随时在这里授权或取消授权\n\n不进行授权不会影响脚本的正常使用，但可能会缺失1080P', 1e4); } } }, [_('text', '（这是什么？）')]),
                 _('br'), _('br'),
